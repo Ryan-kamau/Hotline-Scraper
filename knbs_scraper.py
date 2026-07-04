@@ -821,10 +821,128 @@ class BaseExtractor(ABC):
         pass
 
 
+# ---------------------------------------------------------------------------
+# CBR-specific parsing utilities
+# ---------------------------------------------------------------------------
+#
+# The constants and helper function below are scoped ONLY to CBR table
+# parsing. They convert the raw Camelot dataframe (already located and
+# selected by the reusable PipelineEngine.run() pipeline) into structured
+# CBR records. No reusable pipeline logic is touched or duplicated here.
+# ---------------------------------------------------------------------------
+
+MONTH_NAMES_SET = {
+    "January", "February", "March", "April", "May", "June",
+    "July", "August", "September", "October", "November", "December",
+}
+
+# Zero-based index, within a row's cleaned tokens, where the CBR value
+# is expected to live for KNBS "Interest rate" tables.
+CBR_POSITION = 4
+
+# Rows containing any of these phrases are footnotes/labels, not data rows,
+# and should be skipped.
+_SKIP_ROW_PHRASES = [
+    "source",
+    "notes",
+    "commercial banks",
+    "government treasury",
+    "central bank rates",
+]
+
+
+def parse_cbr_table(dataframe, metadata):
+    """
+    Parse a raw CBR/interest-rate Camelot dataframe (as returned by
+    PipelineEngine.run()) into a list of structured CBR records.
+
+    Args:
+        dataframe (pandas.DataFrame): Raw candidate table selected by the
+            reusable pipeline for the CBR/"Interest rate" target.
+        metadata (dict): Report-level metadata already assembled by
+            CBRExtractor.extract() -- expects "report_date", "month",
+            "year", and "source_url" keys.
+
+    Returns:
+        list[dict]: Structured CBR records, one per recognized month row.
+            Returns an empty list if the dataframe is None/empty or no
+            valid month rows are found.
+    """
+    records = []
+
+    if dataframe is None or dataframe.empty:
+        logger.warning("parse_cbr_table: received empty or None dataframe")
+        return records
+
+    for _, row in dataframe.iterrows():
+        # --- Clean and tokenize the row --------------------------------
+        raw_values = [str(cell) for cell in row.tolist()]
+        tokens = [
+            value.replace("*", "").strip()
+            for value in raw_values
+            if value is not None and value.strip() not in ("", "None")
+        ]
+        tokens = [token for token in tokens if token != ""]
+
+        if not tokens:
+            continue
+
+        logger.info("RAW TOKENS: %s", tokens)
+
+        flattened_row_text = " ".join(tokens).lower()
+
+        # --- Skip footnote / label rows ---------------------------------
+        if any(phrase in flattened_row_text for phrase in _SKIP_ROW_PHRASES):
+            logger.info("Skipping row (matched skip phrase): %s", tokens)
+            continue
+
+        # --- Skip rows that are only a bare year (e.g. "2026", "2026*") --
+        if re.fullmatch(r"20\d{2}", tokens[0].strip()):
+            logger.info("Skipping year-only row: %s", tokens)
+            continue
+
+        # --- Determine whether this is a month row ----------------------
+        month = tokens[0].strip(":").capitalize()
+
+        if month not in MONTH_NAMES_SET:
+            logger.info("Skipping non-month row: %s", tokens)
+            continue
+
+        # --- Validate token count ----------------------------------------
+        if len(tokens) < 5:
+            logger.warning("Skipping %s: not enough tokens (%d)", month, len(tokens))
+            continue
+
+        # --- Extract and validate the CBR value ---------------------------
+        cbr_raw = tokens[CBR_POSITION]
+
+        try:
+            cbr_value = float(cbr_raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Skipping %s: CBR value '%s' invalid", month, cbr_raw
+            )
+            continue
+
+        logger.info("Extracted CBR -> %s = %.2f", month, cbr_value)
+
+        record = {
+            "month": month,
+            "cbr": cbr_value,
+            "report_date": metadata.get("report_date"),
+            "month_of_report": metadata.get("month"),
+            "year_of_report": metadata.get("year"),
+            "source_url": metadata.get("source_url"),
+        }
+        records.append(record)
+
+    logger.info("parse_cbr_table: parsed %d CBR record(s)", len(records))
+    return records
+
+
 class CBRExtractor(BaseExtractor):
     """
-    Placeholder extractor for the CBR (Central Bank Rate) / interest
-    rates table.
+    Extractor for the CBR (Central Bank Rate) / interest rates table.
     """
 
     def extract(self, pdf_url):
@@ -833,7 +951,8 @@ class CBRExtractor(BaseExtractor):
             pdf_url (str): URL to the KNBS PDF report.
 
         Returns:
-            list: Empty list (parsing not yet implemented).
+            list[dict]: Structured CBR records. Empty list if the pipeline
+                could not locate a table or no valid records were parsed.
         """
         local_pdf_path = self.pdf_manager.download_pdf(pdf_url)
         report_metadata = self.pdf_manager.extract_report_date_from_url(pdf_url)
@@ -853,17 +972,139 @@ class CBRExtractor(BaseExtractor):
         }
         logger.info("extract_cbr metadata: %s", metadata)
 
-        # TODO:
-        # Add CBR parsing logic
-        # - Parse table_df into structured records (date, CBR value, etc.)
-        # - Attach `metadata` to each returned record
+        if table_df is None or table_df.empty:
+            logger.error("extract_cbr: no candidate table found; returning empty list")
+            return []
 
-        return []
+        results = parse_cbr_table(table_df, metadata)
+
+        if not self.validator.validate_output(results):
+            logger.warning("extract_cbr: output failed validation")
+
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Inflation-specific parsing utilities
+# ---------------------------------------------------------------------------
+#
+# The constants and helper function below are scoped ONLY to inflation
+# table parsing. They convert the raw Camelot dataframe (already located
+# and selected by the reusable PipelineEngine.run() pipeline) into
+# structured inflation records. No reusable pipeline logic is touched or
+# duplicated here. MONTH_NAMES_SET is reused from the CBR section above.
+# ---------------------------------------------------------------------------
+
+# Kenya inflation is always the last token in a valid month row
+# (Lower Income, Middle Income, Upper Income, Nairobi, Combined, Kenya).
+INFLATION_POSITION = -1
+
+# Rows containing any of these phrases are headers/footnotes/labels, not
+# data rows, and should be skipped.
+_INFLATION_SKIP_ROW_PHRASES = [
+    "source",
+    "notes",
+    "inflation rates",
+    "income",
+    "nairobi",
+    "combined",
+]
+
+
+def parse_inflation_table(dataframe, metadata):
+    """
+    Parse a raw inflation-rate Camelot dataframe (as returned by
+    PipelineEngine.run()) into a list of structured inflation records.
+
+    Args:
+        dataframe (pandas.DataFrame): Raw candidate table selected by the
+            reusable pipeline for the inflation/"Inflation rate" target.
+        metadata (dict): Report-level metadata already assembled by
+            InflationExtractor.extract() -- expects "report_date", "month",
+            "year", and "source_url" keys.
+
+    Returns:
+        list[dict]: Structured inflation records, one per recognized month
+            row. Returns an empty list if the dataframe is None/empty or no
+            valid month rows are found.
+    """
+    records = []
+
+    if dataframe is None or dataframe.empty:
+        logger.warning("parse_inflation_table: received empty or None dataframe")
+        return records
+
+    for _, row in dataframe.iterrows():
+        # --- Clean and tokenize the row --------------------------------
+        raw_values = [str(cell) for cell in row.tolist()]
+        tokens = [
+            value.replace("*", "").strip()
+            for value in raw_values
+            if value is not None and value.strip() not in ("", "None")
+        ]
+        tokens = [token for token in tokens if token != ""]
+
+        if not tokens:
+            continue
+
+        logger.info("RAW INFLATION TOKENS: %s", tokens)
+
+        flattened_row_text = " ".join(tokens).lower()
+
+        # --- Skip header / footnote / label rows -------------------------
+        if any(phrase in flattened_row_text for phrase in _INFLATION_SKIP_ROW_PHRASES):
+            logger.info("Skipping row (matched skip phrase): %s", tokens)
+            continue
+
+        # --- Skip rows that are only a bare year (e.g. "2025", "2026*") --
+        if re.fullmatch(r"20\d{2}", tokens[0].strip()):
+            logger.info("Skipping year-only row: %s", tokens)
+            continue
+
+        # --- Determine whether this is a month row ----------------------
+        month = tokens[0].strip(":").capitalize()
+
+        if month not in MONTH_NAMES_SET:
+            logger.info("Skipping non-month row: %s", tokens)
+            continue
+
+        # --- Extract and validate the Kenya inflation value ---------------
+        inflation_raw = tokens[INFLATION_POSITION]
+
+        try:
+            inflation_value = float(inflation_raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Skipping %s: inflation value '%s' invalid", month, inflation_raw
+            )
+            continue
+
+        logger.info(
+            "Extracted Kenya inflation -> %s = %.2f",
+            month,
+            inflation_value,
+        )
+
+        record = {
+            "month": month,
+            "kenya_inflation": inflation_value,
+            "report_date": metadata.get("report_date"),
+            "month_of_report": metadata.get("month"),
+            "year_of_report": metadata.get("year"),
+            "source_url": metadata.get("source_url"),
+        }
+        records.append(record)
+
+    logger.info(
+        "parse_inflation_table: parsed %d inflation record(s)",
+        len(records)
+    )
+    return records
 
 
 class InflationExtractor(BaseExtractor):
     """
-    Placeholder extractor for the inflation rate table.
+    Extractor for the inflation rate table.
     """
 
     def extract(self, pdf_url):
@@ -872,7 +1113,9 @@ class InflationExtractor(BaseExtractor):
             pdf_url (str): URL to the KNBS PDF report.
 
         Returns:
-            list: Empty list (parsing not yet implemented).
+            list[dict]: Structured inflation records. Empty list if the
+                pipeline could not locate a table or no valid records were
+                parsed.
         """
         local_pdf_path = self.pdf_manager.download_pdf(pdf_url)
         report_metadata = self.pdf_manager.extract_report_date_from_url(pdf_url)
@@ -892,12 +1135,23 @@ class InflationExtractor(BaseExtractor):
         }
         logger.info("extract_inflation metadata: %s", metadata)
 
-        # TODO:
-        # Add inflation parsing logic
-        # - Parse table_df into structured records
-        # - Attach `metadata` to each returned record
+        if table_df is None or table_df.empty:
+            logger.error(
+                "extract_inflation: no candidate table found"
+            )
+            return []
 
-        return []
+        results = parse_inflation_table(
+            table_df,
+            metadata,
+        )
+
+        if not self.validator.validate_output(results):
+            logger.warning(
+                "extract_inflation: output failed validation"
+            )
+
+        return results
 
 
 class ExchangeExtractor(BaseExtractor):
