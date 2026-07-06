@@ -60,6 +60,18 @@ Architecture:
           ├── ExchangeExtractor
           ├── FuelExtractor
           └── StockMarketExtractor
+
+FUEL EXTRACTOR NOTE (see FuelExtractor below):
+    Unlike the other extractors, FuelExtractor does NOT call
+    PipelineEngine.run() end-to-end. It reuses PipelineEngine's individual
+    reusable steps (find_toc, parse_toc, find_table,
+    extract_candidate_tables) but replaces the generic candidate-page
+    window and generic scoring with fuel-specific logic, because the
+    generic 5-page window and generic keyword scoring were drifting into
+    neighboring tables such as "Consumption of Petroleum Fuels" (Table
+    15(c)) instead of "National Average Retail Prices for Selected Fuels
+    in Kenya". PipelineEngine itself is not modified, and no other
+    extractor is affected.
 """
 
 import logging
@@ -758,20 +770,29 @@ TABLE_CONFIG = {
         },
     ),
     "exchange_rates": TableConfig(
-        target="Exchange rate",
+        target="Mean Monthly Foreign Exchange Rates of Kenyan Shilling against Selected Major Currencies",
         keywords={
-            "exchange": 3,
-            "usd": 2,
-            "rate": 1,
+            "foreign": 4,
+            "exchange": 5,
+            "currency": 4,
+            "dollar": 4,
+            "sterling": 4,
+            "euro": 4,
+            "yen": 2,
+            "rand": 2,
         },
     ),
     "fuels": TableConfig(
-        target="Fuel price",
+        # Matched by title/semantic meaning against the TOC, never by table
+        # number (table numbers such as "15(e)" can shift between reports).
+        target="National Average Retail Prices for Selected Fuels in Kenya",
         keywords={
             "fuel": 3,
-            "petrol": 2,
-            "diesel": 2,
-            "kerosene": 1,
+            "diesel": 4,
+            "gasoline": 3,
+            "kerosene": 2,
+            "lpg": 2,
+            "charcoal": 1,
         },
     ),
     "stock_market": TableConfig(
@@ -800,6 +821,8 @@ TABLE_CONFIG = {
 # They do NOT yet parse the resulting dataframe into structured records.
 # That logic will be added table-by-table in the future without touching
 # the reusable pipeline above.
+#
+# (FuelExtractor is the exception -- see its class docstring below.)
 # ---------------------------------------------------------------------------
 
 class BaseExtractor(ABC):
@@ -1154,9 +1177,472 @@ class InflationExtractor(BaseExtractor):
         return results
 
 
+# ---------------------------------------------------------------------------
+# Fuel-specific parsing utilities
+# ---------------------------------------------------------------------------
+#
+# The constants and helper function below are scoped ONLY to fuel table
+# parsing. They convert the raw Camelot dataframe (already located and
+# selected by the fuel-specific selection logic further below) into
+# structured fuel records. No reusable pipeline logic is touched or
+# duplicated here. MONTH_NAMES_SET is reused from the CBR section above.
+# ---------------------------------------------------------------------------
+
+# Zero-based index, within a row's cleaned tokens, where the Light Diesel
+# Oil (KSh per Litre) value is expected to live for the KNBS
+# "National Average Retail Prices for Selected Fuels in Kenya" rows.
+#
+# After cleaning/tokenization:
+#   ["January", "177.25", "167.84", "152.18", "3122.16", "86.22"]
+# positions become:
+#   0 -> month
+#   1 -> gasoline
+#   2 -> diesel
+#   3 -> kerosene
+#   4 -> lpg
+#   5 -> charcoal
+FUEL_DIESEL_POSITION = 2
+
+# Rows containing any of these phrases are headers/footnotes/labels, not
+# data rows, and should be skipped.
+_FUEL_SKIP_ROW_PHRASES = [
+    "source",
+    "notes",
+    "national average retail prices",
+    "motor gasoline",
+    "light diesel",
+    "illuminating",
+    "charcoal",
+    "descriptions",
+    "period",
+]
+
+
+def parse_fuel_table(dataframe, metadata):
+    """
+    Parse a raw fuel-prices Camelot dataframe (as returned by the
+    fuel-specific table selection logic) into a list of structured fuel
+    records.
+
+    Args:
+        dataframe (pandas.DataFrame): Raw candidate table selected for the
+            fuels/"National Average Retail Prices for Selected Fuels in
+            Kenya" target.
+        metadata (dict): Report-level metadata already assembled by
+            FuelExtractor.extract() -- expects "report_date", "month",
+            "year", and "source_url" keys.
+
+    Returns:
+        list[dict]: Structured fuel records, one per recognized month row.
+            Returns an empty list if the dataframe is None/empty or no
+            valid month rows are found.
+    """
+    records = []
+
+    if dataframe is None or dataframe.empty:
+        logger.warning("parse_fuel_table: received empty or None dataframe")
+        return records
+
+    for _, row in dataframe.iterrows():
+        # --- Clean and tokenize the row --------------------------------
+        raw_values = [str(cell) for cell in row.tolist()]
+        tokens = [
+            value.replace("*", "").replace(",", "").strip()
+            for value in raw_values
+            if value is not None and value.strip() not in ("", "None")
+        ]
+        tokens = [token for token in tokens if token != ""]
+
+        if not tokens:
+            continue
+
+        logger.info("RAW FUEL TOKENS: %s", tokens)
+
+        flattened_row_text = " ".join(tokens).lower()
+
+        # --- Skip header / footnote / label rows -------------------------
+        if any(phrase in flattened_row_text for phrase in _FUEL_SKIP_ROW_PHRASES):
+            logger.info("Skipping row (matched skip phrase): %s", tokens)
+            continue
+
+        # --- Skip rows that are only a bare year (e.g. "2025", "2026*") --
+        if re.fullmatch(r"20\d{2}", tokens[0].strip()):
+            logger.info("Skipping year-only row: %s", tokens)
+            continue
+
+        # --- Determine whether this is a month row ----------------------
+        month = tokens[0].strip(":").capitalize()
+
+        if month not in MONTH_NAMES_SET:
+            logger.info("Skipping non-month row: %s", tokens)
+            continue
+
+        # --- Validate token count ----------------------------------------
+        if len(tokens) < 6:
+            logger.warning(
+                "Skipping %s: not enough tokens (%d)",
+                month,
+                len(tokens)
+            )
+            continue
+
+        # --- Extract and validate the diesel value -------------------------
+        diesel_raw = tokens[FUEL_DIESEL_POSITION]
+
+        try:
+            diesel_price = float(diesel_raw)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Skipping %s: diesel value '%s' invalid",
+                month,
+                diesel_raw
+            )
+            continue
+
+        logger.info(
+            "Extracted Diesel price -> %s = %.2f",
+            month,
+            diesel_price
+        )
+
+        record = {
+            "month": month,
+            "diesel_price": diesel_price,
+            "report_date": metadata.get("report_date"),
+            "month_of_report": metadata.get("month"),
+            "year_of_report": metadata.get("year"),
+            "source_url": metadata.get("source_url"),
+        }
+        records.append(record)
+
+    logger.info(
+        "parse_fuel_table: parsed %d fuel record(s)",
+        len(records)
+    )
+    return records
+
+
+# ---------------------------------------------------------------------------
+# Fuel-specific table IDENTIFICATION utilities
+# ---------------------------------------------------------------------------
+#
+# These are deliberately separate from parse_fuel_table() above:
+# parse_fuel_table() turns an ALREADY-SELECTED dataframe into records, while
+# the functions below are responsible for SELECTING the correct dataframe
+# out of several candidates in the first place. They exist because the
+# generic PipelineEngine.select_best_table()/score_table() logic was
+# drifting into neighboring tables (e.g. "Consumption of Petroleum Fuels",
+# "OPEC Reference Basket Prices"). None of this touches PipelineEngine or
+# any other extractor.
+# ---------------------------------------------------------------------------
+
+# Strong positive signals that a candidate table IS the fuel retail-price
+# table. Weighted higher for phrases that are essentially unique to this
+# table's row/column labels.
+FUEL_POSITIVE_KEYWORDS = {
+    "national": 8,
+    "retail": 8,
+    "selected fuels": 10,
+    "kenya": 8,
+    "motor gasoline": 10,
+    "premium": 10,
+    "light diesel": 10,
+    "illuminating kerosene": 10,
+    "l.p.g": 10,
+    "charcoal": 10,
+    "ksh per litre": 6,
+    "ksh per 13 kg": 6,
+    "descriptions": 3,
+    "period": 3,
+    "january": 2,
+    "february": 2,
+    "march": 2,
+    "april": 2,
+    "may": 2,
+    "june": 2,
+    "july": 2,
+    "august": 2,
+    "september": 2,
+    "october": 2,
+    "november": 2,
+    "december": 2,
+}
+
+# Strong negative signals that a candidate table is a DIFFERENT, nearby
+# fuel-related table that should be rejected instead.
+FUEL_PENALTY_KEYWORDS = {
+    "aviation": -15,
+    "jet": -15,
+    "fuel oil": -15,
+    "consumption": -20,
+    "petroleum fuels": -20,
+    "opec": -20,
+}
+
+# A correctly identified fuel retail-price table must mention at least this
+# many of the five core fuel categories somewhere in its cells.
+FUEL_REQUIRED_KEYWORDS = ["motor", "diesel", "kerosene", "l.p.g", "charcoal"]
+FUEL_REQUIRED_MIN_MATCHES = 4
+
+
+def _flatten_table_text(dataframe):
+    """Flatten every cell of a dataframe into one lowercase string."""
+    if dataframe is None or dataframe.empty:
+        return ""
+    return " ".join(str(cell) for cell in dataframe.values.flatten()).lower()
+
+
+def score_fuel_table(dataframe):
+    """
+    Score a candidate dataframe specifically for the fuel retail-price
+    table, combining weighted positive keyword matches with weighted
+    penalties for keywords that indicate a different, nearby table.
+
+    Args:
+        dataframe (pandas.DataFrame): Candidate table to score.
+
+    Returns:
+        int: Total score. Higher is a stronger match for the fuel retail
+            price table; strongly negative scores indicate a different
+            table (e.g. petroleum consumption, OPEC prices).
+    """
+    flattened_text = _flatten_table_text(dataframe)
+    if not flattened_text:
+        return 0
+
+    score = 0
+    for keyword, weight in FUEL_POSITIVE_KEYWORDS.items():
+        occurrences = flattened_text.count(keyword.lower())
+        score += occurrences * weight
+
+    for keyword, weight in FUEL_PENALTY_KEYWORDS.items():
+        occurrences = flattened_text.count(keyword.lower())
+        score += occurrences * weight
+
+    return score
+
+
+def validate_fuel_table(dataframe):
+    """
+    Confirm a candidate dataframe actually contains the core fuel
+    categories expected in the retail-price table before it is accepted.
+
+    Args:
+        dataframe (pandas.DataFrame): Candidate table to validate.
+
+    Returns:
+        bool: True if at least FUEL_REQUIRED_MIN_MATCHES of
+            FUEL_REQUIRED_KEYWORDS are present, False otherwise.
+    """
+    flattened_text = _flatten_table_text(dataframe)
+    if not flattened_text:
+        return False
+
+    matches = sum(1 for keyword in FUEL_REQUIRED_KEYWORDS if keyword in flattened_text)
+    return matches >= FUEL_REQUIRED_MIN_MATCHES
+
+
+def select_fuel_table(candidate_tables):
+    """
+    Select the correct fuel retail-price table out of several narrowly
+    windowed candidates, using fuel-specific scoring and a required-keyword
+    validation gate so petroleum-consumption/OPEC tables are rejected even
+    if they happen to score reasonably well.
+
+    Args:
+        candidate_tables (list[dict]): [{"page": int, "table": DataFrame}, ...]
+
+    Returns:
+        pandas.DataFrame | None: The selected dataframe, or None if no
+            candidate passed validation.
+    """
+    if not candidate_tables:
+        logger.warning("select_fuel_table: no candidate tables available")
+        return None
+
+    scored_candidates = []
+    for index, candidate in enumerate(candidate_tables):
+        table_df = candidate["table"]
+        page = candidate["page"]
+        score = score_fuel_table(table_df)
+
+        logger.info("Table %d page=%d score=%d", index, page, score)
+        if table_df is not None and not table_df.empty:
+            logger.info("TABLE PREVIEW:\n%s", table_df.head(10))
+
+        scored_candidates.append((score, index, page, table_df))
+
+    # Highest score first; ties broken by original (page) order.
+    scored_candidates.sort(key=lambda item: item[0], reverse=True)
+
+    for score, index, page, table_df in scored_candidates:
+        if validate_fuel_table(table_df):
+            logger.info(
+                "Selected table title=%s page=%d score=%d",
+                TABLE_CONFIG["fuels"].target, page, score,
+            )
+            return table_df
+
+        logger.warning(
+            "Rejected candidate table %d (page=%d, score=%d): "
+            "failed required fuel-keyword validation",
+            index, page, score,
+        )
+
+    logger.error("select_fuel_table: no candidate table passed validation")
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Exchange-rate-specific parsing utilities
+# ---------------------------------------------------------------------------
+#
+# The constants and helper function below are scoped ONLY to exchange-rate
+# table parsing. They convert the raw Camelot dataframe (already located
+# and selected by the reusable PipelineEngine.run() pipeline) into
+# structured exchange-rate records. No reusable pipeline logic is touched
+# or duplicated here. MONTH_NAMES_SET is reused from the CBR section above.
+# ---------------------------------------------------------------------------
+
+# Column positions (within a cleaned month-row's tokens) for the three
+# currencies extracted from Table 2 ("Mean Monthly Foreign Exchange Rates
+# of Kenyan Shilling against Selected Major Currencies"). Japanese Yen, SA
+# Rand, USHS/KSh, and TSHS/KSh columns are intentionally ignored.
+EXCHANGE_COLUMNS = {
+    "usd": 1,
+    "pound_sterling": 2,
+    "euro": 3,
+}
+
+# Rows containing any of these phrases are headers/footnotes/labels, not
+# data rows, and should be skipped.
+_EXCHANGE_SKIP_ROW_PHRASES = [
+    "currency",
+    "period",
+    "source",
+    "figure",
+]
+
+# A valid month row must contain at least this many numeric values
+# (beyond the leading month token) to be considered well-formed.
+_EXCHANGE_MIN_NUMERIC_VALUES = 4
+
+
+def parse_exchange_dataframe(dataframe):
+    """
+    Parse a raw exchange-rate Camelot dataframe (as returned by
+    PipelineEngine.run()) into a list of structured exchange-rate records.
+
+    Only three currencies are extracted per KNBS Table 2: 1 US Dollar,
+    1 Pound Sterling, and 1 Euro. Japanese Yen, SA Rand, USHS/KSh, and
+    TSHS/KSh columns are ignored.
+
+    Args:
+        dataframe (pandas.DataFrame): Raw candidate table selected by the
+            reusable pipeline for the exchange_rates/"Mean Monthly Foreign
+            Exchange Rates..." target.
+
+    Returns:
+        list[dict]: Structured exchange-rate records, one per recognized
+            month row, each with "month", "year", "usd", "pound_sterling",
+            and "euro" keys. Returns an empty list if the dataframe is
+            None/empty or no valid month rows are found.
+    """
+    records = []
+
+    if dataframe is None or dataframe.empty:
+        logger.warning("parse_exchange_dataframe: received empty or None dataframe")
+        return records
+
+    current_year = None
+    rows = dataframe.values.tolist()
+
+    for raw_row in rows:
+        # --- Clean and tokenize the row --------------------------------
+        raw_values = [str(cell) for cell in raw_row]
+        tokens = [
+            value.replace("*", "").replace(",", "").strip()
+            for value in raw_values
+            if value is not None and value.strip() not in ("", "None")
+        ]
+        tokens = [token for token in tokens if token != ""]
+
+        if not tokens:
+            continue
+
+        logger.info("RAW EXCHANGE TOKENS: %s", tokens)
+
+        flattened_row_text = " ".join(tokens).lower()
+
+        # --- Skip header / footnote / label rows -------------------------
+        if any(phrase in flattened_row_text for phrase in _EXCHANGE_SKIP_ROW_PHRASES):
+            logger.info("Skipping row (matched skip phrase): %s", tokens)
+            continue
+
+        # --- Detect year rows (e.g. "2025", "2026") ----------------------
+        if re.fullmatch(r"20\d{2}", tokens[0].strip()):
+            current_year = int(tokens[0].strip())
+            logger.info("Detected year row: current_year=%s", current_year)
+            continue
+
+        # --- Determine whether this is a month row ----------------------
+        month = tokens[0].strip(":").capitalize()
+
+        if month not in MONTH_NAMES_SET:
+            logger.info("Skipping non-month row: %s", tokens)
+            continue
+
+        # --- Validate numeric value count ---------------------------------
+        numeric_tokens = tokens[1:]
+        if len(numeric_tokens) < _EXCHANGE_MIN_NUMERIC_VALUES:
+            logger.warning(
+                "Skipping %s: not enough numeric tokens (%d)",
+                month, len(numeric_tokens),
+            )
+            continue
+
+        # --- Extract and validate USD / Pound Sterling / Euro values ------
+        try:
+            usd = float(tokens[EXCHANGE_COLUMNS["usd"]])
+            pound_sterling = float(tokens[EXCHANGE_COLUMNS["pound_sterling"]])
+            euro = float(tokens[EXCHANGE_COLUMNS["euro"]])
+        except (TypeError, ValueError, IndexError):
+            logger.warning(
+                "Skipping %s: could not parse currency values from tokens %s",
+                month, tokens,
+            )
+            continue
+
+        logger.info(
+            "Parsed exchange row: %s %s USD=%s GBP=%s EUR=%s",
+            month, current_year, usd, pound_sterling, euro,
+        )
+
+        record = {
+            "month": month,
+            "year": current_year,
+            "usd": usd,
+            "pound_sterling": pound_sterling,
+            "euro": euro,
+        }
+        records.append(record)
+
+    logger.info(
+        "parse_exchange_dataframe: parsed %d exchange record(s)",
+        len(records),
+    )
+    return records
+
+
 class ExchangeExtractor(BaseExtractor):
     """
-    Placeholder extractor for the exchange rates table.
+    Extractor for the exchange rates table ("Mean Monthly Foreign Exchange
+    Rates of Kenyan Shilling against Selected Major Currencies").
+
+    Like CBRExtractor and InflationExtractor, this extractor calls
+    PipelineEngine.run() end-to-end and does not touch any reusable
+    pipeline logic. Only exchange-specific parsing
+    (parse_exchange_dataframe) is added.
     """
 
     def extract(self, pdf_url):
@@ -1165,56 +1651,158 @@ class ExchangeExtractor(BaseExtractor):
             pdf_url (str): URL to the KNBS PDF report.
 
         Returns:
-            list: Empty list (parsing not yet implemented).
+            dict | None: {
+                "report_metadata": {...},
+                "exchange_rates": [...],
+            }
+            or None if the pipeline could not locate a table or the parsed
+            output failed generic validation.
         """
-        local_pdf_path = self.pdf_manager.download_pdf(pdf_url)
-        report_metadata = self.pdf_manager.extract_report_date_from_url(pdf_url)
+        local_pdf = self.pdf_manager.download_pdf(pdf_url)
 
-        config = TABLE_CONFIG["exchange_rates"]
-        table_df = self.pipeline.run(
-            pdf_path=local_pdf_path,
-            target=config.target,
-            keywords=config.keywords,
+        report_metadata = self.pdf_manager.extract_report_date_from_url(
+            pdf_url
         )
 
-        metadata = {
-            "source_url": pdf_url,
-            "report_date": report_metadata["report_date"] if report_metadata else None,
-            "month": report_metadata["month"] if report_metadata else None,
-            "year": report_metadata["year"] if report_metadata else None,
+        config = TABLE_CONFIG["exchange_rates"]
+
+        dataframe = self.pipeline.run(
+            local_pdf,
+            config.target,
+            config.keywords,
+        )
+
+        if dataframe is None:
+            logger.error(
+                "Exchange extraction failed"
+            )
+            return None
+
+        logger.info(
+            "Raw exchange dataframe:\n%s",
+            dataframe.to_string()
+        )
+
+        parsed_data = parse_exchange_dataframe(
+            dataframe
+        )
+
+        logger.info(
+            "Extracted %d exchange records",
+            len(parsed_data)
+        )
+
+        if not self.validator.validate_output(
+            parsed_data
+        ):
+            return None
+
+        return {
+            "report_metadata": report_metadata,
+            "exchange_rates": parsed_data
         }
-        logger.info("extract_exchange_rates metadata: %s", metadata)
-
-        # TODO:
-        # Add exchange rate parsing logic
-        # - Parse table_df into structured records
-        # - Attach `metadata` to each returned record
-
-        return []
 
 
 class FuelExtractor(BaseExtractor):
     """
-    Placeholder extractor for the fuel prices table.
+    Extractor for the fuel prices table ("National Average Retail Prices
+    for Selected Fuels in Kenya").
+
+    Unlike the other extractors, this one does NOT call
+    PipelineEngine.run() end-to-end. It reuses PipelineEngine's individual
+    reusable steps (find_toc, parse_toc, find_table,
+    extract_candidate_tables) directly, but:
+
+      * Looks the target table up by its title only (never by a table
+        number like "15(e)"), via PipelineEngine.find_table(), so the
+        lookup survives KNBS renumbering tables between reports.
+      * Replaces the generic 5-page forward window
+        (PipelineEngine.locate_candidate_pages) with a widened forward
+        window computed off a real PDF page, since the fuel-related tables
+        are sequential (15(c) -> 15(d) -> 15(e) -> 15(f)) and a narrow
+        window was stopping before reaching 15(e).
+      * Replaces the generic keyword scoring
+        (PipelineEngine.score_table/select_best_table) with fuel-specific
+        scoring plus a required-keyword validation gate (see
+        score_fuel_table / validate_fuel_table / select_fuel_table above),
+        so tables like "Consumption of Petroleum Fuels" or "OPEC Reference
+        Basket Prices" are rejected even if a keyword or two overlaps.
+
+    PipelineEngine itself is not modified by any of this, and no other
+    extractor is affected.
     """
 
-    def extract(self, pdf_url):
+    # Pages to search before the computed real PDF page.
+    PAGE_WINDOW_BEFORE = 1
+    # Pages to search after the computed real PDF page. Widened from the
+    # original narrow +/-1 window so the forward-only sequence of fuel
+    # tables (15(c) -> 15(d) -> 15(e) -> 15(f)) does not get cut off
+    # before reaching 15(e).
+    PAGE_WINDOW_AFTER = 3
+
+    def _compute_candidate_pages(self, toc_page, document_page, total_pages):
         """
+        Convert a TOC's printed page number into a widened window of real
+        PDF page numbers to search, instead of the generic broad forward
+        window.
+
+        Assumption: printed document page numbering restarts at 1
+        immediately after the TOC page, so the (zero-based) index of the
+        TOC page itself is the offset between printed page numbers and
+        actual PDF page numbers. This offset is computed per-PDF (never
+        hardcoded) so it adapts automatically if KNBS changes how many
+        front-matter pages precede the numbered content.
+
+        The window is widened forward (rather than kept narrowly centered)
+        because the fuel-related tables are sequential in the report
+        (15(c) -> 15(d) -> 15(e) -> 15(f)), and the target table, 15(e),
+        can land a couple of pages after the TOC-referenced page.
+
         Args:
-            pdf_url (str): URL to the KNBS PDF report.
+            toc_page (int): Zero-based PDF page index of the TOC, from
+                PipelineEngine.find_toc().
+            document_page (int): Printed page number from the matched TOC
+                entry, from PipelineEngine.find_table().
+            total_pages (int): Total number of pages in the PDF, used to
+                clamp the window to a valid range.
 
         Returns:
-            list: Empty list (parsing not yet implemented).
+            list[int]: A clamped list of candidate page numbers spanning
+                from just before to several pages after the computed real
+                PDF page.
         """
+        offset = toc_page
+        real_pdf_page = document_page + offset
+
+        # Fuel tables are sequential:
+        # 15(c) -> 15(d) -> 15(e) -> 15(f)
+        # Expand forward search so we do not stop before 15(e)
+        candidate_pages = [
+            page
+            for page in range(
+                real_pdf_page - self.PAGE_WINDOW_BEFORE,
+                real_pdf_page + self.PAGE_WINDOW_AFTER + 1,
+            )
+            if 1 <= page <= total_pages
+        ]
+
+        logger.info(
+            "extract_fuels: document_page=%s "
+            "toc_page=%s offset=%s "
+            "real_pdf_page=%s "
+            "candidate_pages=%s",
+            document_page,
+            toc_page,
+            offset,
+            real_pdf_page,
+            candidate_pages,
+        )
+        return candidate_pages
+
+    def extract(self, pdf_url):
+
         local_pdf_path = self.pdf_manager.download_pdf(pdf_url)
         report_metadata = self.pdf_manager.extract_report_date_from_url(pdf_url)
-
-        config = TABLE_CONFIG["fuels"]
-        table_df = self.pipeline.run(
-            pdf_path=local_pdf_path,
-            target=config.target,
-            keywords=config.keywords,
-        )
 
         metadata = {
             "source_url": pdf_url,
@@ -1222,14 +1810,63 @@ class FuelExtractor(BaseExtractor):
             "month": report_metadata["month"] if report_metadata else None,
             "year": report_metadata["year"] if report_metadata else None,
         }
-        logger.info("extract_fuels metadata: %s", metadata)
 
-        # TODO:
-        # Add fuel price parsing logic
-        # - Parse table_df into structured records
-        # - Attach `metadata` to each returned record
+        config = TABLE_CONFIG["fuels"]
 
-        return []
+        pdf = self.pdf_manager.load_pdf(local_pdf_path)
+
+        try:
+            toc_page = self.pipeline.find_toc(pdf)
+            entries = self.pipeline.parse_toc(pdf, toc_page)
+
+            matched_entry = self.pipeline.find_table(
+                entries,
+                config.target
+            )
+
+            if matched_entry is None:
+                logger.error(
+                    "extract_fuels: no matching TOC entry"
+                )
+                return []
+
+            total_pages = len(pdf.pages)
+
+            candidate_pages = self._compute_candidate_pages(
+                toc_page,
+                matched_entry["document_page"],
+                total_pages
+            )
+
+            candidate_tables = (
+                self.pipeline.extract_candidate_tables(
+                    local_pdf_path,
+                    candidate_pages
+                )
+            )
+
+        finally:
+            pdf.close()
+
+        table_df = select_fuel_table(candidate_tables)
+
+        if table_df is None or table_df.empty:
+            logger.error(
+                "extract_fuels: no candidate table found"
+            )
+            return []
+
+        results = parse_fuel_table(
+            table_df,
+            metadata,
+        )
+
+        if not self.validator.validate_output(results):
+            logger.warning(
+                "extract_fuels: output failed validation"
+            )
+
+        return results
 
 
 class StockMarketExtractor(BaseExtractor):
