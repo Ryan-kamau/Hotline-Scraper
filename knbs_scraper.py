@@ -741,6 +741,59 @@ class Validator:
 
 
 # ---------------------------------------------------------------------------
+# Standardized extractor response helper
+# ---------------------------------------------------------------------------
+#
+# This helper ONLY shapes the final return value of each extractor's
+# extract() method into a common structure. It performs no extraction,
+# parsing, scoring, or validation of its own, and does not alter any of
+# the existing business logic above -- it is purely a formatting step
+# applied to already-produced results.
+# ---------------------------------------------------------------------------
+
+def build_extractor_response(table_name, metadata, pdf_url, data, status=None):
+    """
+    Build the standardized top-level response object returned by every
+    table-specific extractor.
+
+    Args:
+        table_name (str): Human-readable table name (e.g. "Interest Rate").
+        metadata (dict | None): Report-level metadata dict containing at
+            least a "report_date" key. May be None if report date
+            extraction failed; in that case "report_date" in the response
+            will be None.
+        pdf_url (str): The original PDF URL passed into the extractor.
+        data (list): The already-parsed records for this table, exactly as
+            produced by the extractor's existing parsing logic.
+        status (str | None): Explicit status override, either "success" or
+            "failed". If not provided, status is inferred: "success" if
+            `data` is non-empty, otherwise "failed".
+
+    Returns:
+        dict: {
+            "table_name": str,
+            "report_date": str | None,
+            "status": "success" | "failed",
+            "source_url": str,
+            "data": list,
+        }
+    """
+    if data is None:
+        data = []
+
+    if status is None:
+        status = "success" if data else "failed"
+
+    return {
+        "table_name": table_name,
+        "report_date": metadata.get("report_date") if metadata else None,
+        "status": status,
+        "source_url": pdf_url,
+        "data": data,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Configuration storage
 # ---------------------------------------------------------------------------
 
@@ -892,6 +945,7 @@ def parse_cbr_table(dataframe, metadata):
             valid month rows are found.
     """
     records = []
+    current_year = None
 
     if dataframe is None or dataframe.empty:
         logger.warning("parse_cbr_table: received empty or None dataframe")
@@ -919,9 +973,12 @@ def parse_cbr_table(dataframe, metadata):
             logger.info("Skipping row (matched skip phrase): %s", tokens)
             continue
 
-        # --- Skip rows that are only a bare year (e.g. "2026", "2026*") --
+       # --- Year header row (e.g. "2024", "2025", "2026") ----------------
         if re.fullmatch(r"20\d{2}", tokens[0].strip()):
-            logger.info("Skipping year-only row: %s", tokens)
+            current_year = int(tokens[0])
+
+            logger.info("Current parsing year set to %d", current_year)
+
             continue
 
         # --- Determine whether this is a month row ----------------------
@@ -951,11 +1008,8 @@ def parse_cbr_table(dataframe, metadata):
 
         record = {
             "month": month,
-            "cbr": cbr_value,
-            "report_date": metadata.get("report_date"),
-            "month_of_report": metadata.get("month"),
-            "year_of_report": metadata.get("year"),
-            "source_url": metadata.get("source_url"),
+            "year" : current_year,
+            "cbr": cbr_value
         }
         records.append(record)
 
@@ -974,8 +1028,9 @@ class CBRExtractor(BaseExtractor):
             pdf_url (str): URL to the KNBS PDF report.
 
         Returns:
-            list[dict]: Structured CBR records. Empty list if the pipeline
-                could not locate a table or no valid records were parsed.
+            dict: Standardized extractor response (see
+                build_extractor_response()), with "data" containing the
+                structured CBR records.
         """
         local_pdf_path = self.pdf_manager.download_pdf(pdf_url)
         report_metadata = self.pdf_manager.extract_report_date_from_url(pdf_url)
@@ -997,14 +1052,14 @@ class CBRExtractor(BaseExtractor):
 
         if table_df is None or table_df.empty:
             logger.error("extract_cbr: no candidate table found; returning empty list")
-            return []
+            return build_extractor_response("Interest Rate", metadata, pdf_url, [])
 
         results = parse_cbr_table(table_df, metadata)
 
         if not self.validator.validate_output(results):
             logger.warning("extract_cbr: output failed validation")
 
-        return results
+        return build_extractor_response("Interest Rate", metadata, pdf_url, results)
 
 
 # ---------------------------------------------------------------------------
@@ -1052,6 +1107,7 @@ def parse_inflation_table(dataframe, metadata):
             valid month rows are found.
     """
     records = []
+    current_year = None
 
     if dataframe is None or dataframe.empty:
         logger.warning("parse_inflation_table: received empty or None dataframe")
@@ -1079,9 +1135,12 @@ def parse_inflation_table(dataframe, metadata):
             logger.info("Skipping row (matched skip phrase): %s", tokens)
             continue
 
-        # --- Skip rows that are only a bare year (e.g. "2025", "2026*") --
+        # --- Year header row (e.g. "2024", "2025", "2026") ----------------
         if re.fullmatch(r"20\d{2}", tokens[0].strip()):
-            logger.info("Skipping year-only row: %s", tokens)
+            current_year = int(tokens[0])
+
+            logger.info("Current parsing year set to %d", current_year)
+
             continue
 
         # --- Determine whether this is a month row ----------------------
@@ -1110,11 +1169,8 @@ def parse_inflation_table(dataframe, metadata):
 
         record = {
             "month": month,
-            "kenya_inflation": inflation_value,
-            "report_date": metadata.get("report_date"),
-            "month_of_report": metadata.get("month"),
-            "year_of_report": metadata.get("year"),
-            "source_url": metadata.get("source_url"),
+            "year" : current_year,
+            "kenya_inflation": inflation_value
         }
         records.append(record)
 
@@ -1136,9 +1192,9 @@ class InflationExtractor(BaseExtractor):
             pdf_url (str): URL to the KNBS PDF report.
 
         Returns:
-            list[dict]: Structured inflation records. Empty list if the
-                pipeline could not locate a table or no valid records were
-                parsed.
+            dict: Standardized extractor response (see
+                build_extractor_response()), with "data" containing the
+                structured inflation records.
         """
         local_pdf_path = self.pdf_manager.download_pdf(pdf_url)
         report_metadata = self.pdf_manager.extract_report_date_from_url(pdf_url)
@@ -1162,7 +1218,9 @@ class InflationExtractor(BaseExtractor):
             logger.error(
                 "extract_inflation: no candidate table found"
             )
-            return []
+            return build_extractor_response(
+                "Consumer Price Indices and Inflation Rates", metadata, pdf_url, []
+            )
 
         results = parse_inflation_table(
             table_df,
@@ -1174,7 +1232,9 @@ class InflationExtractor(BaseExtractor):
                 "extract_inflation: output failed validation"
             )
 
-        return results
+        return build_extractor_response(
+            "Consumer Price Indices and Inflation Rates", metadata, pdf_url, results
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -1238,6 +1298,7 @@ def parse_fuel_table(dataframe, metadata):
             valid month rows are found.
     """
     records = []
+    current_year = None
 
     if dataframe is None or dataframe.empty:
         logger.warning("parse_fuel_table: received empty or None dataframe")
@@ -1265,9 +1326,12 @@ def parse_fuel_table(dataframe, metadata):
             logger.info("Skipping row (matched skip phrase): %s", tokens)
             continue
 
-        # --- Skip rows that are only a bare year (e.g. "2025", "2026*") --
+        # --- Year header row (e.g. "2024", "2025", "2026") ----------------
         if re.fullmatch(r"20\d{2}", tokens[0].strip()):
-            logger.info("Skipping year-only row: %s", tokens)
+            current_year = int(tokens[0])
+
+            logger.info("Current parsing year set to %d", current_year)
+
             continue
 
         # --- Determine whether this is a month row ----------------------
@@ -1307,11 +1371,8 @@ def parse_fuel_table(dataframe, metadata):
 
         record = {
             "month": month,
+            "year": current_year,
             "diesel_price": diesel_price,
-            "report_date": metadata.get("report_date"),
-            "month_of_report": metadata.get("month"),
-            "year_of_report": metadata.get("year"),
-            "source_url": metadata.get("source_url"),
         }
         records.append(record)
 
@@ -1651,12 +1712,9 @@ class ExchangeExtractor(BaseExtractor):
             pdf_url (str): URL to the KNBS PDF report.
 
         Returns:
-            dict | None: {
-                "report_metadata": {...},
-                "exchange_rates": [...],
-            }
-            or None if the pipeline could not locate a table or the parsed
-            output failed generic validation.
+            dict: Standardized extractor response (see
+                build_extractor_response()), with "data" containing the
+                structured exchange-rate records.
         """
         local_pdf = self.pdf_manager.download_pdf(pdf_url)
 
@@ -1676,7 +1734,9 @@ class ExchangeExtractor(BaseExtractor):
             logger.error(
                 "Exchange extraction failed"
             )
-            return None
+            return build_extractor_response(
+                "Exchange Rates", report_metadata, pdf_url, []
+            )
 
         logger.info(
             "Raw exchange dataframe:\n%s",
@@ -1695,12 +1755,13 @@ class ExchangeExtractor(BaseExtractor):
         if not self.validator.validate_output(
             parsed_data
         ):
-            return None
+            return build_extractor_response(
+                "Exchange Rates", report_metadata, pdf_url, [], status="failed"
+            )
 
-        return {
-            "report_metadata": report_metadata,
-            "exchange_rates": parsed_data
-        }
+        return build_extractor_response(
+            "Exchange Rates", report_metadata, pdf_url, parsed_data
+        )
 
 
 class FuelExtractor(BaseExtractor):
@@ -1828,7 +1889,12 @@ class FuelExtractor(BaseExtractor):
                 logger.error(
                     "extract_fuels: no matching TOC entry"
                 )
-                return []
+                return build_extractor_response(
+                    "National Average Retail Prices for Selected Fuels",
+                    metadata,
+                    pdf_url,
+                    [],
+                )
 
             total_pages = len(pdf.pages)
 
@@ -1854,7 +1920,12 @@ class FuelExtractor(BaseExtractor):
             logger.error(
                 "extract_fuels: no candidate table found"
             )
-            return []
+            return build_extractor_response(
+                "National Average Retail Prices for Selected Fuels",
+                metadata,
+                pdf_url,
+                [],
+            )
 
         results = parse_fuel_table(
             table_df,
@@ -1866,7 +1937,12 @@ class FuelExtractor(BaseExtractor):
                 "extract_fuels: output failed validation"
             )
 
-        return results
+        return build_extractor_response(
+            "National Average Retail Prices for Selected Fuels",
+            metadata,
+            pdf_url,
+            results,
+        )
 
 
 class StockMarketExtractor(BaseExtractor):
@@ -1880,7 +1956,10 @@ class StockMarketExtractor(BaseExtractor):
             pdf_url (str): URL to the KNBS PDF report.
 
         Returns:
-            list: Empty list (parsing not yet implemented).
+            dict: Standardized extractor response (see
+                build_extractor_response()). "data" is currently always
+                empty since parsing is not yet implemented, so "status"
+                will be "failed".
         """
         local_pdf_path = self.pdf_manager.download_pdf(pdf_url)
         report_metadata = self.pdf_manager.extract_report_date_from_url(pdf_url)
@@ -1905,7 +1984,7 @@ class StockMarketExtractor(BaseExtractor):
         # - Parse table_df into structured records
         # - Attach `metadata` to each returned record
 
-        return []
+        return build_extractor_response("Stock Market", metadata, pdf_url, [])
 
 
 # ---------------------------------------------------------------------------
